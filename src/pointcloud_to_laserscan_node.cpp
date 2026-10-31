@@ -196,21 +196,22 @@ void PointCloudToLaserScanNode::cloudCallback(
       continue;
     }
 
-    double range = hypot(*iter_x, *iter_y);
-    if (range < range_min_) {
+    const double range_sq = (*iter_x) * (*iter_x) + (*iter_y) * (*iter_y);
+    if (range_sq < range_min_ * range_min_) {
       RCLCPP_DEBUG(
         this->get_logger(),
-        "rejected for range %f below minimum value %f. Point: (%f, %f, %f)",
-        range, range_min_, *iter_x, *iter_y, *iter_z);
+        "rejected for squared range %f below minimum value %f. Point: (%f, %f, %f)",
+        range_sq, range_min_ * range_min_, *iter_x, *iter_y, *iter_z);
       continue;
     }
-    if (range > range_max_) {
+    if (range_sq > range_max_) {
       RCLCPP_DEBUG(
         this->get_logger(),
-        "rejected for range %f above maximum value %f. Point: (%f, %f, %f)",
-        range, range_max_, *iter_x, *iter_y, *iter_z);
+        "rejected for squared range %f above maximum value %f. Point: (%f, %f, %f)",
+        range_sq, range_max_, *iter_x, *iter_y, *iter_z);
       continue;
     }
+    const double range = std::sqrt(range_sq);
 
     double angle = atan2(*iter_y, *iter_x);
     if (angle < scan_msg->angle_min || angle > scan_msg->angle_max) {
