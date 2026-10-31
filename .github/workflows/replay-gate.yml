@@ -1,0 +1,49 @@
+# Copy to .github/workflows/replay-gate.yml in ForetellAI/pointcloud_to_laserscan
+# (on the `jazzy` branch, which is the fork's default branch).
+#
+# Make the check required: Settings > Branches > protect `jazzy` > require the
+# status check named "replay-gate / gate" (<this job id> / <reusable job id>).
+# See ci/README.md in the gate repo for the full list of manual settings.
+name: Replay gate
+
+on:
+  pull_request:
+    branches: [jazzy]
+
+# A called workflow can't raise its own permissions, so grant them here.
+permissions:
+  contents: read
+  pull-requests: write
+
+# One run per PR: a new push cancels the previous (slow) run.
+concurrency:
+  group: replay-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  replay-gate:
+    uses: ForetellAI/replay-gate-demo/.github/workflows/replay-gate.yml@main
+    with:
+      fork_repo: ${{ github.repository }}
+      base_ref: ${{ github.event.pull_request.base.ref }}
+      head_ref: ${{ github.event.pull_request.head.sha }}
+
+# ---------------------------------------------------------------------------
+# STRETCH, off by default: embed worst_frame.png in the comment. Grant
+# `contents: write` above and add `embed_images: true` under `with:`.
+# The PNG is pushed to an orphan `gate-images` branch and linked by commit SHA.
+# ---------------------------------------------------------------------------
+# STRETCH, off by default: gate a release against the previous v* tag. Add
+# `release: {types: [published]}` to `on:` and this job (base_ref is empty, so
+# the reusable workflow uses `git describe --tags --abbrev=0 --match 'v*' HEAD^`,
+# or the branch point with `jazzy` for the first tag). Create the release with
+#   gh release create v1.0.0 --repo ForetellAI/pointcloud_to_laserscan --target jazzy
+# and drop `concurrency` or key it on github.ref for that trigger.
+#
+#   release-gate:
+#     if: github.event_name == 'release'
+#     uses: ForetellAI/replay-gate-demo/.github/workflows/replay-gate.yml@main
+#     with:
+#       fork_repo: ${{ github.repository }}
+#       head_ref: ${{ github.event.release.tag_name }}
+#       post_comment: false
