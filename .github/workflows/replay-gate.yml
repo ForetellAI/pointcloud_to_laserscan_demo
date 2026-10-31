@@ -1,49 +1,349 @@
-# Copy to .github/workflows/replay-gate.yml in ForetellAI/pointcloud_to_laserscan
-# (on the `jazzy` branch, which is the fork's default branch).
-#
-# Make the check required: Settings > Branches > protect `jazzy` > require the
-# status check named "replay-gate / gate" (<this job id> / <reusable job id>).
-# See ci/README.md in the gate repo for the full list of manual settings.
 name: Replay gate
+
+# Standalone gate workflow for a public repo whose gate repo is PRIVATE.
+# (A public repo can't call a reusable workflow from a private one, so the
+# reusable workflow's job is inlined here.) The private gate repo is checked
+# out with the GATE_REPO_TOKEN secret: a fine-grained PAT, resource owner
+# ForetellAI, repository replay-gate-demo only, Contents: read-only.
+# If the GHCR image can't be pulled (it's private too), the job builds it.
+# Generated from ForetellAI/replay-gate-demo/.github/workflows/replay-gate.yml
+# by ci/make_standalone_caller.py; edit those, not this file.
 
 on:
   pull_request:
     branches: [jazzy]
 
-# A called workflow can't raise its own permissions, so grant them here.
 permissions:
   contents: read
   pull-requests: write
 
-# One run per PR: a new push cancels the previous (slow) run.
 concurrency:
   group: replay-gate-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
-jobs:
-  replay-gate:
-    uses: ForetellAI/replay-gate-demo/.github/workflows/replay-gate.yml@main
-    with:
-      fork_repo: ${{ github.repository }}
-      base_ref: ${{ github.event.pull_request.base.ref }}
-      head_ref: ${{ github.event.pull_request.head.sha }}
+env:
+  GATE_REPO: ForetellAI/replay-gate-demo
+  GATE_REF: main
+  GATE_IMAGE: ghcr.io/foretellai/replay-gate:jazzy
+  GATE_VARIANTS: ""
+  EMBED_IMAGES: "false"   # stretch: needs contents: write
 
-# ---------------------------------------------------------------------------
-# STRETCH, off by default: embed worst_frame.png in the comment. Grant
-# `contents: write` above and add `embed_images: true` under `with:`.
-# The PNG is pushed to an orphan `gate-images` branch and linked by commit SHA.
-# ---------------------------------------------------------------------------
-# STRETCH, off by default: gate a release against the previous v* tag. Add
-# `release: {types: [published]}` to `on:` and this job (base_ref is empty, so
-# the reusable workflow uses `git describe --tags --abbrev=0 --match 'v*' HEAD^`,
-# or the branch point with `jazzy` for the first tag). Create the release with
-#   gh release create v1.0.0 --repo ForetellAI/pointcloud_to_laserscan --target jazzy
-# and drop `concurrency` or key it on github.ref for that trigger.
-#
-#   release-gate:
-#     if: github.event_name == 'release'
-#     uses: ForetellAI/replay-gate-demo/.github/workflows/replay-gate.yml@main
-#     with:
-#       fork_repo: ${{ github.repository }}
-#       head_ref: ${{ github.event.release.tag_name }}
-#       post_comment: false
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      verdict: ${{ steps.decide.outputs.label }}
+      exit_code: ${{ steps.gate.outputs.exit_code }}
+    env:
+      OUT_DIR: ${{ github.workspace }}/out
+    steps:
+      - name: Check out the gate repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GATE_REPO }}
+          ref: ${{ env.GATE_REF }}
+          token: ${{ secrets.GATE_REPO_TOKEN }}
+          path: gate-repo
+          persist-credentials: false
+
+      - name: Check out the code under test (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: fork
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      # gate.sh clones the repo itself and takes refs. Resolve to SHAs here so
+      # an unknown ref fails early and the record shows exact commits.
+      - name: Resolve base and head to commit SHAs
+        id: refs
+        shell: bash
+        working-directory: fork
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          FALLBACK_REF: jazzy
+        run: |
+          resolve() {
+            git rev-parse --verify --quiet "refs/remotes/origin/$1^{commit}" \
+              || git rev-parse --verify --quiet "refs/tags/$1^{commit}" \
+              || git rev-parse --verify --quiet "$1^{commit}"
+          }
+          head_sha="$(resolve "$HEAD_REF")" || { echo "::error::head ref '$HEAD_REF' not found"; exit 1; }
+          if [ -n "$BASE_REF" ]; then
+            base_sha="$(resolve "$BASE_REF")" || { echo "::error::base ref '$BASE_REF' not found"; exit 1; }
+            base_desc="$BASE_REF"
+          elif prev="$(git describe --tags --abbrev=0 --match 'v*' "${head_sha}^" 2>/dev/null)"; then
+            # Release mode (stretch): previous v* tag before the head.
+            base_sha="$(resolve "$prev")"
+            base_desc="previous tag $prev"
+          else
+            # First tag: compare with the branch point.
+            base_sha="$(git merge-base "$head_sha" "refs/remotes/origin/$FALLBACK_REF")" \
+              || { echo "::error::no previous tag and no branch point with '$FALLBACK_REF'"; exit 1; }
+            base_desc="branch point with $FALLBACK_REF"
+          fi
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "Base: $base_sha ($base_desc)"
+          echo "Head: $head_sha ($HEAD_REF)"
+
+      # Pull the published image; if that fails (package not built yet, or
+      # still private), build it from the gate repo under the same tag, so
+      # gate.sh finds it locally. Building takes a few minutes.
+      - name: Get the gate image
+        shell: bash
+        env:
+          IMAGE: ${{ env.GATE_IMAGE }}
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull "$IMAGE"; then exit 0; fi
+            echo "docker pull failed (attempt $attempt)"; sleep 10
+          done
+          echo "::warning::Could not pull $IMAGE; building it from the gate repo instead"
+          docker build -f gate-repo/docker/Dockerfile -t "$IMAGE" gate-repo
+
+      # Exit codes: contracts/cli.md. Never fail here: later steps (artifact,
+      # comment) must run, and "Enforce verdict" fails the job at the end.
+      - name: Run the gate
+        id: gate
+        shell: bash
+        env:
+          FORK_REPO: ${{ github.repository }}
+          BASE_SHA: ${{ steps.refs.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.refs.outputs.head_sha }}
+          IMAGE: ${{ env.GATE_IMAGE }}
+          VARIANTS: ${{ env.GATE_VARIANTS }}
+          CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          args=(
+            --repo "https://github.com/${FORK_REPO}"
+            --base "$BASE_SHA"
+            --head "$HEAD_SHA"
+            --out "$OUT_DIR"
+            --image "$IMAGE"
+            --ci-run-url "$CI_RUN_URL"
+          )
+          if [ -n "$VARIANTS" ]; then args+=(--variants "$VARIANTS"); fi
+          set +e
+          bash "$GITHUB_WORKSPACE/gate-repo/scripts/gate.sh" "${args[@]}"
+          code=$?
+          set -e
+          echo "gate.sh exited with $code"
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+
+      - name: Make out/ readable by the runner user
+        if: always()
+        shell: bash
+        run: |
+          if [ -d "$OUT_DIR" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "$OUT_DIR" || true
+          fi
+
+      # exit 0 -> PASS or WARN (from verdict.json), 1 -> BLOCK, anything else
+      # (2, or the gate never ran) -> INFRA.
+      - name: Decide verdict label and write the job summary
+        id: decide
+        if: always()
+        shell: bash
+        env:
+          EXIT_CODE: ${{ steps.gate.outputs.exit_code }}
+        run: |
+          verdict=""
+          infra_reason=""
+          if [ -f "$OUT_DIR/verdict.json" ]; then
+            verdict="$(jq -r '.verdict // empty' "$OUT_DIR/verdict.json" 2>/dev/null || true)"
+            infra_reason="$(jq -r '.infra_reason // empty' "$OUT_DIR/verdict.json" 2>/dev/null || true)"
+          fi
+          reason=""
+          case "$EXIT_CODE" in
+            0)
+              case "$verdict" in
+                PASS|WARN) label="$verdict" ;;
+                *) label="INFRA"; reason="gate.sh exited 0 but out/verdict.json says '${verdict:-<missing>}'" ;;
+              esac ;;
+            1) label="BLOCK" ;;
+            2) label="INFRA"; reason="${infra_reason:-gate.sh exited 2 (see logs in the artifact)}" ;;
+            "") label="INFRA"; reason="the gate did not run (an earlier step failed)" ;;
+            *) label="INFRA"; reason="gate.sh exited with unexpected code $EXIT_CODE" ;;
+          esac
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Replay gate: ${label}"
+            echo
+            case "$label" in
+              PASS) echo "Exit code 0. No rule regressed and the output is unchanged." ;;
+              WARN) echo "Exit code 0 (check is green). **WARN**: the output changed but every rule still holds." ;;
+              BLOCK) echo "Exit code 1 (check fails). **BLOCK**: a safety rule regressed." ;;
+              INFRA) echo "Exit code ${EXIT_CODE:-n/a} (check fails). **INFRA**: no verdict on the code, the gate itself failed: ${reason}" ;;
+            esac
+            echo
+            if [ -f "$OUT_DIR/report.md" ]; then
+              cat "$OUT_DIR/report.md"
+            else
+              echo "No report.md was produced. Logs are in the uploaded artifact (out/logs/)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload out/ as an artifact
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: replay-gate-out
+          path: out/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # Stretch (off by default): embed the PNG by commit-SHA URL.
+      - name: Publish worst_frame.png to the gate-images branch (stretch)
+        id: image
+        if: always() && env.EMBED_IMAGES == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ steps.refs.outputs.head_sha }}
+        run: |
+          if [ ! -f "$OUT_DIR/worst_frame.png" ]; then echo "no worst_frame.png"; exit 0; fi
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          gitx() { git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" "$@"; }
+          dir="pr-${PR_NUMBER:-0}"
+          name="${HEAD_SHA}.png"
+          work="$(mktemp -d)"
+          cd "$work"
+          git init -q
+          git config user.name "replay-gate"
+          git config user.email "replay-gate@users.noreply.github.com"
+          git remote add origin "https://github.com/${REPO}.git"
+          for attempt in 1 2 3; do
+            if gitx ls-remote --exit-code --heads origin gate-images > /dev/null 2>&1; then
+              gitx fetch -q --depth 1 origin gate-images
+              git checkout -q -B gate-images FETCH_HEAD
+            else
+              git checkout -q --orphan gate-images
+            fi
+            mkdir -p "$dir"
+            cp "$OUT_DIR/worst_frame.png" "$dir/$name"
+            git add "$dir/$name"
+            git commit -q -m "gate image for ${HEAD_SHA}"
+            if gitx push -q origin gate-images; then
+              commit="$(git rev-parse HEAD)"
+              echo "url=https://raw.githubusercontent.com/${REPO}/${commit}/${dir}/${name}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "push failed (attempt $attempt), retrying"
+            git reset -q --hard
+            sleep 3
+          done
+          exit 1
+
+      - name: Post or update the sticky PR comment
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          LABEL: ${{ steps.decide.outputs.label }}
+          REASON: ${{ steps.decide.outputs.reason }}
+          EXIT_CODE: ${{ steps.gate.outputs.exit_code }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          HEAD_SHA: ${{ steps.refs.outputs.head_sha }}
+          BASE_SHA: ${{ steps.refs.outputs.base_sha }}
+          IMAGE_URL: ${{ steps.image.outputs.url }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const marker = '<!-- replay-gate -->';
+            const env = process.env;
+            const prNumber = Number(env.PR_NUMBER);
+            if (!prNumber) {
+              core.info('No pull request to comment on; skipping the sticky comment.');
+              return;
+            }
+            const label = env.LABEL || 'INFRA';
+            const short = (s) => (s ? s.slice(0, 7) : 'unknown');
+            let report = '';
+            try {
+              report = fs.readFileSync(path.join(env.GITHUB_WORKSPACE, 'out', 'report.md'), 'utf8').trim();
+            } catch (e) {
+              report = '';
+            }
+            const artifact = env.ARTIFACT_URL
+              ? `[uploaded artifact \`replay-gate-out\`](${env.ARTIFACT_URL})`
+              : 'the uploaded artifact `replay-gate-out` (see the run page)';
+
+            const lines = [
+              marker,
+              `## Replay gate: ${label}`,
+              '',
+              `[Workflow run](${env.RUN_URL}) | base \`${short(env.BASE_SHA)}\` | head \`${short(env.HEAD_SHA)}\``,
+              '',
+            ];
+            if (report) {
+              lines.push(report);
+            } else {
+              lines.push(
+                `**INFRA: the gate could not produce a verdict.** This says nothing about the code under test.`,
+                '',
+                env.REASON ? `Reason: ${env.REASON}` : `gate.sh exit code: ${env.EXIT_CODE || 'n/a'}`,
+                '',
+                `Build, node and harness logs are in the ${artifact} (\`out/logs/\`).`,
+              );
+            }
+            if (env.IMAGE_URL) {
+              lines.push('', `![worst frame](${env.IMAGE_URL})`);
+            }
+            let body = lines.join('\n');
+            const limit = 60000;
+            if (body.length > limit) {
+              body = body.slice(0, limit) +
+                `\n\n_Comment truncated. Full report: ${artifact}._`;
+            }
+
+            const { owner, repo } = context.repo;
+            try {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: prNumber, per_page: 100,
+              });
+              const existing = comments.find((c) => c.body && c.body.startsWith(marker));
+              if (existing) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+                core.info(`Updated comment ${existing.id}`);
+              } else {
+                const created = await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+                core.info(`Created comment ${created.data.id}`);
+              }
+            } catch (err) {
+              // Do not hide the gate result behind a comment failure (e.g. a
+              // read-only token on a PR from another fork).
+              core.warning(`Could not post the PR comment: ${err.message}`);
+            }
+
+      - name: Enforce verdict
+        if: always()
+        shell: bash
+        env:
+          LABEL: ${{ steps.decide.outputs.label }}
+          REASON: ${{ steps.decide.outputs.reason }}
+        run: |
+          case "$LABEL" in
+            PASS) echo "Replay gate: PASS" ;;
+            WARN) echo "::notice title=Replay gate WARN::Output changed, all rules hold (check is green)." ;;
+            BLOCK)
+              echo "::error title=Replay gate BLOCK::A safety rule regressed. See the PR comment or the job summary."
+              exit 1 ;;
+            *)
+              echo "::error title=Replay gate INFRA::${REASON:-gate infrastructure failure}. No verdict on the code; see logs in the artifact."
+              exit 2 ;;
+          esac
